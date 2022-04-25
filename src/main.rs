@@ -15,8 +15,7 @@ use tower_http::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-
-
+use minion_msg::{MinionMsg, MinionOps};
 
 #[tokio::main]
 async fn main() {
@@ -67,15 +66,32 @@ async fn ws_handler(
     ws.on_upgrade(handle_socket)
 }
 
+enum MinionStates {
+    Connected,
+    Authenticated,
+    Idle,
+    Working,
+}
+struct Minion {
+    id: i128,
+    state: MinionStates, 
+}
+
+
 async fn handle_socket(mut socket: WebSocket) {
+    let state = Minion {id: 0, state: MinionStates::Connected};
+
     if let Some(msg) = socket.recv().await {
         if let Ok(msg) = msg {
             match msg {
                 Message::Text(t) => {
                     println!("client sent str: {:?}", t);
                 }
-                Message::Binary(_) => {
+                Message::Binary(b) => {
                     println!("client sent binary data");
+                    let m = minion_msg::from_bytes(&b).unwrap();
+                    println!("op: {:?}", m.op);
+
                 }
                 Message::Ping(_) => {
                     println!("socket ping");
