@@ -73,13 +73,13 @@ enum MinionStates {
     Working,
 }
 struct Minion {
-    id: i128,
+    id: minion_msg::MinionId,
     state: MinionStates, 
 }
 
 
 async fn handle_socket(mut socket: WebSocket) {
-    let state = Minion {id: 0, state: MinionStates::Connected};
+    let mut minion = Minion {id: minion_msg::MinionId::nil(), state: MinionStates::Connected};
 
     if let Some(msg) = socket.recv().await {
         if let Ok(msg) = msg {
@@ -91,7 +91,24 @@ async fn handle_socket(mut socket: WebSocket) {
                     println!("client sent binary data");
                     let m = minion_msg::from_bytes(&b).unwrap();
                     println!("op: {:?}", m.op);
-
+                    match m.op {
+                        MinionOps::Auth => {
+                            minion.id = m.payload.into();
+                            minion.state = MinionStates::Authenticated;
+                            
+                            socket.send(
+                                Message::Binary(
+                                    minion_msg::to_vec(&minion_msg::MinionMsg{ 
+                                        op: minion_msg::MinionOps::Exec,
+                                        payload: vec![0],
+                                    }).unwrap()
+                                )
+                            ).await.unwrap()
+                        }
+                        MinionOps::Exec => {
+                            println!("client tried to exec")
+                        }
+                    }
                 }
                 Message::Ping(_) => {
                     println!("socket ping");
@@ -110,16 +127,5 @@ async fn handle_socket(mut socket: WebSocket) {
         }
     }
 
-    loop {
-        if socket
-            .send(Message::Text(String::from("Hi!")))
-            .await
-            .is_err()
-        {
-            println!("client disconnected");
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
 }
 
