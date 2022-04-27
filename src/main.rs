@@ -19,14 +19,6 @@ use minion_msg::{MinionMsg, MinionOps};
 
 #[tokio::main]
 async fn main() {
-    let module_wat = r#"
-    (module
-      (type $t0 (func (param i32) (result i32)))
-      (func $add_one (export "add_one") (type $t0) (param $p0 i32) (result i32)
-        get_local $p0
-        i32.const 1
-        i32.add))
-    "#;
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG")
@@ -81,7 +73,20 @@ struct Minion {
 async fn handle_socket(mut socket: WebSocket) {
     let mut minion = Minion {id: minion_msg::MinionId::nil(), state: MinionStates::Connected};
 
-    if let Some(msg) = socket.recv().await {
+    let thejob = r#"
+    (module
+      (type $t0 (func (param i32) (result i32)))
+      (type $t1 (func (param) (result i32)))
+      (func $add_one (export "add_one") (type $t0) (param $p0 i32) (result i32)
+        get_local $p0
+        i32.const 1
+        i32.add)
+      (func $run (export "run") (type $t1) (result i32)
+        i32.const 42
+        call $add_one))
+    "#;
+
+    while let Some(msg) = socket.recv().await {
         if let Ok(msg) = msg {
             match msg {
                 Message::Text(t) => {
@@ -100,10 +105,13 @@ async fn handle_socket(mut socket: WebSocket) {
                                 Message::Binary(
                                     minion_msg::to_vec(&minion_msg::MinionMsg{ 
                                         op: minion_msg::MinionOps::Exec,
-                                        payload: vec![0],
+                                        payload: thejob.into(),
                                     }).unwrap()
                                 )
                             ).await.unwrap()
+                        }
+                        MinionOps::Ret => {
+                            println!("minion returned {:?}", m.payload)
                         }
                         MinionOps::Exec => {
                             println!("client tried to exec")
