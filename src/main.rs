@@ -77,7 +77,7 @@ async fn ws_handler(
 
     let ch = state.sup_ch.clone();
     ws.on_upgrade(|s| async move {
-        ch.send(MinionSupMessages::Connection{socket: s});
+        ch.send(MinionSupMessages::Connection{socket: s}).await; //XXX
     })
 }
 
@@ -144,6 +144,7 @@ impl MinionSupActor {
                                     println!("op: {:?}", m.op);
                                     match m.op {
                                         MinionOps::Auth => {
+                                            println!("handling {:?}", m.op);
                                             let m = MinionSupMessages::Connected {
                                                 id: m.payload.into(),
                                                 socket: socket,
@@ -176,8 +177,17 @@ impl MinionSupActor {
                     actor_ch: MinionActor{}.start(&id, socket),
                     id: id.clone(),
                 };
+                let c = mi.actor_ch.clone();
                 state.minions.insert(id.clone(), mi);
-
+                
+                tokio::spawn(async move  {
+                    use std::time::Duration;
+use tokio::time::sleep;
+                    sleep(Duration::from_millis(3000)).await;
+                    c.send(MinionMessages::Job).await;
+                    println!("it's job time");
+                });
+                
             },
             _ => {
                 panic!()
@@ -230,7 +240,7 @@ impl MinionActor {
 
         tokio::spawn(async move {
             while let Some(msg) = state.rx.recv().await {
-                self.handle(&mut state, msg);
+                self.handle(&mut state, msg).await;
             }
         });
 
@@ -238,10 +248,11 @@ impl MinionActor {
     }
 }
 impl MinionActor {
-    fn handle(&self, state: &mut MinionState, msg: MinionMessages) -> () {
+    async fn handle(&self, state: &mut MinionState, msg: MinionMessages) -> () {
         match msg {
             MinionMessages::Job => {
-    let thejob = r#"
+                println!("{:?} Job", state.id);
+                let thejob = r#"
     (module
       (type $t0 (func (param i32) (result i32)))
       (type $t1 (func (param) (result i32)))
@@ -254,13 +265,14 @@ impl MinionActor {
         call $add_one))
     "#;
 
-    state.sender.send(
-        Message::Binary(minion_msg::to_vec(
-                &minion_msg::MinionMsg{ 
-                    op: minion_msg::MinionOps::Exec,
-                    payload: thejob.into(),
-                }
-        ).unwrap()));
+                    state.sender.send(
+                    Message::Binary(minion_msg::to_vec(
+                            &minion_msg::MinionMsg{ 
+                                op: minion_msg::MinionOps::Exec,
+                                payload: thejob.into(),
+                            }
+                    ).unwrap())
+                ).await;// XXX
             }
         }
     }
