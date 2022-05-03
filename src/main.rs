@@ -1,21 +1,34 @@
+
+use std::collections::hash_map::HashMap;
+use std::sync::Arc;
+
 use axum::{
+    extract::Extension,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         TypedHeader,
     },
     http::{StatusCode, Uri},
     response::IntoResponse,
-    routing::{get, get_service},
+    routing::get,
     Router,
 };
+use futures::{sink::SinkExt, stream::{StreamExt, SplitSink, SplitStream}};
 use std::net::SocketAddr;
+use tokio::sync::mpsc;
 use tower_http::{
-    services::ServeDir,
     trace::{DefaultMakeSpan, TraceLayer},
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use minion_msg::{MinionMsg, MinionOps};
+
+
+
+
+    struct ServerState {
+        sup_ch: mpsc::Sender<MinionSupMessages>,
+    }
 
 #[tokio::main]
 async fn main() {
@@ -27,8 +40,14 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let state = ServerState{
+        sup_ch: MinionSupActor{}.start(),
+    };
+    let shared_state = Arc::new(state);
+    
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .layer(Extension(shared_state))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::default().include_headers(true)),
@@ -48,6 +67,7 @@ async fn fallback(uri: Uri) -> impl IntoResponse {
 }
 
 async fn ws_handler(
+    Extension(state): Extension<Arc<ServerState>>,
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
 ) -> impl IntoResponse {
@@ -55,24 +75,172 @@ async fn ws_handler(
         println!("`{}` connected", user_agent.as_str());
     }
 
-    ws.on_upgrade(handle_socket)
+    let ch = state.sup_ch.clone();
+    ws.on_upgrade(|s| async move {
+        ch.send(MinionSupMessages::Connection{socket: s});
+    })
 }
 
-enum MinionStates {
-    Connected,
-    Authenticated,
+
+
+
+
+#[derive(Debug)]
+enum MinionSupMessages {
+    Connection {
+        socket: WebSocket, 
+    },
+    Connected {
+        id: minion_msg::MinionId,
+        socket: WebSocket,
+    },
+    Job {
+    }
+}
+
+struct MinionSupActor {
+}
+
+struct MinionSupState {
+    minions: HashMap<minion_msg::MinionId, Minion>,
+    rx: mpsc::Receiver<MinionSupMessages>,
+    tx: mpsc::Sender<MinionSupMessages>,
+}
+
+
+impl MinionSupActor {
+    fn start(self) -> mpsc::Sender<MinionSupMessages> {
+        let (tx, rx) = mpsc::channel(100); 
+        
+        let mut state = MinionSupState{
+            minions: HashMap::new(),
+            rx: rx,
+            tx: tx.clone(),
+        };
+
+
+        tokio::spawn(async move {
+            while let Some(msg) = state.rx.recv().await {
+                self.handle(&mut state, msg);
+            }
+        });
+
+        tx
+    }
+}
+
+
+impl MinionSupActor {
+    fn handle(&self, state: &mut MinionSupState, msg: MinionSupMessages) -> () {
+        match msg {
+            MinionSupMessages::Connection { mut socket } => {
+                let c = state.tx.clone();
+                tokio::spawn(async move {
+                    while let Some(msg) = socket.recv().await {
+                        if let Ok(msg) = msg {
+                            match msg {
+                                Message::Binary(b) => {
+                                    let m = minion_msg::from_bytes(&b).unwrap();
+                                    println!("op: {:?}", m.op);
+                                    match m.op {
+                                        MinionOps::Auth => {
+                                            let m = MinionSupMessages::Connected {
+                                                id: m.payload.into(),
+                                                socket: socket,
+                                            };
+                                            return c.send(m).await.unwrap();
+                                        }
+                                        _ => {
+                                            println!("invalid message in connect {:?}", m.op);
+                                            socket.close();
+                                            return;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    println!("invalid message type");
+                                    socket.close();
+                                    return;
+                                }
+                            }
+                        } else {
+                            return;
+                            // XXX premature disconnection 
+                        }
+                    }
+                });
+            },
+            MinionSupMessages::Connected { id, socket } => {
+                // XXX HANDLE RECONNECT
+                let mi = Minion {
+                    actor_ch: MinionActor{}.start(&id, socket),
+                    id: id.clone(),
+                };
+                state.minions.insert(id.clone(), mi);
+
+            },
+            _ => {
+                panic!()
+            }
+        }
+    }
+}
+
+
+struct Minion {
+    id: minion_msg::MinionId,
+    actor_ch: mpsc::Sender<MinionMessages>,
+}
+
+enum MinionSM {
     Idle,
     Working,
 }
-struct Minion {
-    id: minion_msg::MinionId,
-    state: MinionStates, 
+
+enum MinionMessages {
+    Job,
 }
 
+struct MinionActor {
+}
 
-async fn handle_socket(mut socket: WebSocket) {
-    let mut minion = Minion {id: minion_msg::MinionId::nil(), state: MinionStates::Connected};
+struct MinionState {
+    id: minion_msg::MinionId,
+    rx: mpsc::Receiver<MinionMessages>,
+    state: MinionSM,
+   // sockchan: mpsc::Sender<minion_msg::MinionMsg>,
+    sender: SplitSink<WebSocket, Message>,
+}
 
+impl MinionActor {
+    fn start(mut self, id: &minion_msg::MinionId, mut s: WebSocket) -> mpsc::Sender<MinionMessages> {
+        let (tx, rx) = mpsc::channel(100); 
+        
+        let (mut sender, mut receiver) = s.split();
+
+        let mut state = MinionState{
+            id: id.clone(),
+            state: MinionSM::Idle,
+            rx: rx,
+            //sockchan: self.handle_socket(socket),
+            sender: sender,
+        };
+    
+    self.handle_socket(&state, receiver); // XXXX
+
+        tokio::spawn(async move {
+            while let Some(msg) = state.rx.recv().await {
+                self.handle(&mut state, msg);
+            }
+        });
+
+        tx 
+    }
+}
+impl MinionActor {
+    fn handle(&self, state: &mut MinionState, msg: MinionMessages) -> () {
+        match msg {
+            MinionMessages::Job => {
     let thejob = r#"
     (module
       (type $t0 (func (param i32) (result i32)))
@@ -86,54 +254,59 @@ async fn handle_socket(mut socket: WebSocket) {
         call $add_one))
     "#;
 
-    while let Some(msg) = socket.recv().await {
-        if let Ok(msg) = msg {
-            match msg {
-                Message::Text(t) => {
-                    println!("client sent str: {:?}", t);
+    state.sender.send(
+        Message::Binary(minion_msg::to_vec(
+                &minion_msg::MinionMsg{ 
+                    op: minion_msg::MinionOps::Exec,
+                    payload: thejob.into(),
                 }
-                Message::Binary(b) => {
-                    println!("client sent binary data");
-                    let m = minion_msg::from_bytes(&b).unwrap();
-                    println!("op: {:?}", m.op);
-                    match m.op {
-                        MinionOps::Auth => {
-                            minion.id = m.payload.into();
-                            minion.state = MinionStates::Authenticated;
-                            
-                            socket.send(
-                                Message::Binary(
-                                    minion_msg::to_vec(&minion_msg::MinionMsg{ 
-                                        op: minion_msg::MinionOps::Exec,
-                                        payload: thejob.into(),
-                                    }).unwrap()
-                                )
-                            ).await.unwrap()
+        ).unwrap()));
+            }
+        }
+    }
+
+    fn handle_socket(&self, state: &MinionState, mut receiver: SplitStream<WebSocket>) {
+
+        let id = state.id.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = receiver.next().await {
+                if let Ok(msg) = msg {
+                    match msg {
+                        Message::Text(t) => {
+                            println!("client sent str: {:?}", t);
                         }
-                        MinionOps::Ret => {
-                            println!("minion returned {:?}", m.payload)
+                        Message::Binary(b) => {
+                            println!("client sent binary data");
+                            let m = minion_msg::from_bytes(&b).unwrap();
+                            println!("op: {:?}", m.op);
+                            match m.op {
+                                MinionOps::Ret => {
+                                    println!("minion returned {:?}", m.payload)
+                                },
+                                _ => {
+                                    println!("minion {:?} bad message {:?}", id, m.op);
+                                }
+                            }
                         }
-                        MinionOps::Exec => {
-                            println!("client tried to exec")
+                        Message::Ping(_) => {
+                            println!("socket ping");
+                        }
+                        Message::Pong(_) => {
+                            println!("socket pong");
+                        }
+                        Message::Close(_) => {
+                            println!("client disconnected");
+                            return;
                         }
                     }
-                }
-                Message::Ping(_) => {
-                    println!("socket ping");
-                }
-                Message::Pong(_) => {
-                    println!("socket pong");
-                }
-                Message::Close(_) => {
+                } else {
                     println!("client disconnected");
                     return;
                 }
             }
-        } else {
-            println!("client disconnected");
-            return;
-        }
+        });
     }
-
 }
+
+
 

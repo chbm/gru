@@ -15,3 +15,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.2.0", features = ["fs", "trace"] }
 headers = "0.3"
 minion_msg = { version = "0.1.0", path = "../minion_msg" }
+async-trait = "0.1.53"
+enum_dispatch = "0.3.8"
+futures = "0.3.21"
