@@ -19,3 +19,4 @@ async-trait = "0.1.53"
 enum_dispatch = "0.3.8"
 futures = "0.3.21"
 uuid = { version = "1.0.0", features = [ "v4", ] }
+murray = { path = "../murray" }

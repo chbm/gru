@@ -1,4 +1,3 @@
-
 use std::collections::hash_map::HashMap;
 use std::sync::Arc;
 
@@ -27,6 +26,10 @@ use minion_msg::{MinionMsg, MinionOps};
 
 use uuid::Uuid as JobId;
 
+use murray::actor;
+
+
+
 #[derive(Clone, Debug)]
 struct Job {
     id: JobId,
@@ -34,7 +37,7 @@ struct Job {
 
 
 struct ServerState {
-    sup_ch: mpsc::Sender<MinionSupMessages>,
+    sup_ch: mpsc::Sender<MinionSupActorMessages>,
 }
 
 #[tokio::main]
@@ -84,7 +87,7 @@ async fn ws_handler(
 
     let ch = state.sup_ch.clone();
     ws.on_upgrade(|s| async move {
-        match ch.send(MinionSupMessages::Connection{socket: s}).await {
+        match ch.send(MinionSupActorMessages::Connection(MinionSupActorMessagesConnection{socket: s})).await {
             Ok(_) => (),
             Err(e) => {
                 panic!("handle supervisor dying {:?}", e);
@@ -94,7 +97,6 @@ async fn ws_handler(
 }
 
 
-
 #[derive(Debug)]
 enum JobErrors {
     BadCode,
@@ -102,8 +104,9 @@ enum JobErrors {
     MinionUnavailable
 }
 
-#[derive(Debug)]
-enum MinionSupMessages {
+actor! {
+ MinionSup,
+ Messages: {
     Connection {
         socket: WebSocket, 
     },
@@ -116,178 +119,141 @@ enum MinionSupMessages {
     JobResult {
         job_id: JobId,
         result: Result<Vec<u8>,JobErrors>,
-    }
-}
-
-struct MinionSupActor {
-}
-
-struct MinionSupState {
-    minions: HashMap<minion_msg::MinionId, Minion>,
-    rx: mpsc::Receiver<MinionSupMessages>,
-    tx: mpsc::Sender<MinionSupMessages>,
+    },
+ },
+ State: {
+    minions: HashMap<minion_msg::MinionId, Minion>, 
+ }
 }
 
 
 impl MinionSupActor {
-    fn start(self) -> mpsc::Sender<MinionSupMessages> {
-        let (tx, rx) = mpsc::channel(100); 
-        
-        let mut state = MinionSupState{
-            minions: HashMap::new(),
-            rx: rx,
-            tx: tx.clone(),
-        };
 
-
-        tokio::spawn(async move {
-            while let Some(msg) = state.rx.recv().await {
-                self.handle(&mut state, msg);
-            }
-        });
-
-        tx
-    }
-}
-
-
-impl MinionSupActor {
-    fn handle(&self, state: &mut MinionSupState, msg: MinionSupMessages) -> () {
-        match msg {
-            MinionSupMessages::Connection { mut socket } => {
-                let c = state.tx.clone();
-                tokio::spawn(async move {
-                    while let Some(msg) = socket.recv().await {
-                        if let Ok(msg) = msg {
-                            match msg {
-                                Message::Binary(b) => {
-                                    let m = minion_msg::from_bytes(&b).unwrap();
-                                    println!("op: {:?}", m.op);
-                                    match m.op {
-                                        MinionOps::Auth => {
-                                            println!("handling {:?}", m.op);
-                                            let m = MinionSupMessages::Connected {
-                                                id: m.payload.into(),
-                                                socket: socket,
-                                            };
-                                            return c.send(m).await.unwrap();
-                                        }
-                                        _ => {
-                                            println!("invalid message in connect {:?}", m.op);
-                                            socket.close().await.unwrap_or_default();
-                                            return;
-                                        }
-                                    }
+    async fn handle_connection(&self, state: &mut MinionSupActorState, payload: MinionSupActorMessagesConnection) { 
+        let mut socket = payload.socket;
+        let c = state.tx.clone();
+            while let Some(msg) = socket.recv().await {
+                if let Ok(msg) = msg {
+                    match msg {
+                        Message::Binary(b) => {
+                            let m = minion_msg::from_bytes(&b).unwrap();
+                            println!("op: {:?}", m.op);
+                            match m.op {
+                                MinionOps::Auth => {
+                                    println!("handling {:?}", m.op);
+                                    let m = MinionSupActorMessages::Connected(MinionSupActorMessagesConnected{
+                                        id: m.payload.into(),
+                                        socket: socket,
+                                    });
+                                    return c.send(m).await.unwrap();
                                 }
                                 _ => {
-                                    println!("invalid message type");
+                                    println!("invalid message in connect {:?}", m.op);
                                     socket.close().await.unwrap_or_default();
                                     return;
                                 }
                             }
-                        } else {
+                        }
+                        _ => {
+                            println!("invalid message type");
+                            socket.close().await.unwrap_or_default();
                             return;
-                            // XXX premature disconnection 
                         }
                     }
-                });
-            },
-            MinionSupMessages::Connected { id, socket } => {
-                // XXX HANDLE RECONNECT
-                let mi = Minion {
-                    actor_ch: MinionActor{}.start(Some(state.tx.clone()), &id),
-                    id: id.clone(),
-                };
-                let c = mi.actor_ch.clone();
-                c.try_send(MinionMessages::Connected{socket}).unwrap();
-                state.minions.insert(id.clone(), mi);
-            },
-            MinionSupMessages::Job {  } => {
-                // XXX TODO
+                } else {
+                    return;
+                    // XXX premature disconnection 
+                }
             }
-            MinionSupMessages::JobResult { job_id , result } => {
-                println!("job {:?} completed with result {:?}", job_id, result );
-            },
+    }
+
+    async fn handle_connected(&self, state: &mut MinionSupActorState, payload: MinionSupActorMessagesConnected) { 
+        let id = payload.id;
+        let socket = payload.socket;
+        // XXX HANDLE RECONNECT
+        let mi = Minion {
+            actor_ch: MinionActor{}.start(Some(state.tx.clone()), &id),
+            id: id.clone(),
+        };
+        let c = mi.actor_ch.clone();
+        c.try_send(MinionActorMessages::Connected(MinionActorMessagesConnected{socket})).unwrap();
+        if state.minions.is_none() {
+            state.minions = Some(HashMap::new());
+        }
+        if let Some(mm) = state.minions.as_mut() {
+            mm.insert(id.clone(), mi);
+        } else {
+            panic!("MinionSup lost minion cache")
         }
     }
-}
 
+    async fn handle_job(&self, state: &mut MinionSupActorState, payload: MinionSupActorMessagesJob) { 
 
-struct Minion {
-    id: minion_msg::MinionId,
-    actor_ch: mpsc::Sender<MinionMessages>,
+        // XXX TODO
+    }
+
+    async fn handle_jobresult(&self, state: &mut MinionSupActorState, payload: MinionSupActorMessagesJobResult) { 
+        println!("job {:?} completed with result {:?}", payload.job_id, payload.result );
+    }
 }
 
 
 #[derive(Debug)]
-enum MinionMessages {
-    Connected{ socket: WebSocket },
-    Exec{ job: Job },
-    Ret{ result: Result<Vec<u8>, minion_msg::MinionErrors> },
-}
-
-struct MinionActor {
-}
-
-struct MinionState {
+struct Minion {
     id: minion_msg::MinionId,
-    rx: mpsc::Receiver<MinionMessages>,
-    tx: mpsc::Sender<MinionMessages>,
-    sender: Option<SplitSink<WebSocket, Message>>,
-    onjob: Option<uuid::Uuid>,
-    sup_ch: Option<mpsc::Sender<MinionSupMessages>>,
+    actor_ch: mpsc::Sender<MinionActorMessages>,
 }
 
-impl MinionActor {
-    fn start(mut self, sup: Option<mpsc::Sender<MinionSupMessages>>, id: &minion_msg::MinionId) -> mpsc::Sender<MinionMessages> {
-        let (tx, rx) = mpsc::channel(100); 
-        
 
-        let mut state = MinionState{
-            id: id.clone(),
-            rx: rx,
-            tx: tx.clone(),
-            sender: None,
-            onjob: None,
-            sup_ch: sup,
-        };
-    
 
-        tokio::spawn(async move {
-            while let Some(msg) = state.rx.recv().await {
-                self.handle(&mut state, msg).await;
-            }
-        });
-
-        tx 
+actor! {
+    Minion,
+    Options: {
+        sup: MinionSup,
+        id: minion_msg::MinionId,
+    },
+    Messages: {
+    Connected { socket: WebSocket },
+    Exec { job: Job },
+    Ret { result: Result<Vec<u8>, minion_msg::MinionErrors> },
+    },
+    State: {
+    sender: SplitSink<WebSocket, Message>,
+    onjob: uuid::Uuid,
     }
 }
 
+
+
 impl MinionActor {
-    async fn handle(&self, state: &mut MinionState, msg: MinionMessages) -> () {
-        match msg {
-            MinionMessages::Connected{socket} => {
-                let (mut sender, mut receiver) = socket.split();
-                state.sender = Some(sender);
-                self.handle_socket(&state, receiver); // XXXX
+    async fn handle_connected(&self, state: &mut MinionActorState, payload: MinionActorMessagesConnected) { 
 
-                state.tx.send(MinionMessages::Exec{job: Job{id: uuid::Uuid::new_v4()}}).await;
-            },
+        let (mut sender, mut receiver) = payload.socket.split();
+        state.sender = Some(sender);
+        self.handle_socket(&state, receiver);
 
-            MinionMessages::Exec { job } => {
-                if state.onjob != None {
-                    match state.sup_ch.as_mut() {
-                        Some(c) => c.send(
-                            MinionSupMessages::JobResult { 
-                                job_id: job.id, 
-                                result: Err(JobErrors::MinionUnavailable)
-                                    }).await.unwrap_or_default(),
-                        None => ()
-                    }
-                    return;
-                }
+        let c = state.tx.clone();
+        tokio::spawn(async move { 
+            c.send(MinionActorMessages::Exec(MinionActorMessagesExec{job: Job{id: uuid::Uuid::new_v4()}})).await;
+        });
+    }
 
-                let thejob = r#"
+    async fn handle_exec(&self, state: &mut MinionActorState, payload: MinionActorMessagesExec) { 
+        if state.onjob != None {
+            match state.sup_ch.as_mut() {
+                Some(c) => {
+                    c.send(
+                        MinionSupActorMessages::JobResult(MinionSupActorMessagesJobResult{ 
+                            job_id: payload.job.id, 
+                            result: Err(JobErrors::MinionUnavailable)
+                        })).await.unwrap_or_default()
+                },
+                None => ()
+            }
+            return;
+        }
+
+        let thejob = r#"
     (module
       (type $t0 (func (param i32) (result i32)))
       (type $t1 (func (param) (result i32)))
@@ -299,37 +265,39 @@ impl MinionActor {
         i32.const 42
         call $add_one))
     "#;
-                match state.sender.as_mut() {
-                    Some(s) => {
-                        match s.send(
-                            Message::Binary(minion_msg::to_vec(
-                                    &minion_msg::MinionMsg{ 
-                                        op: minion_msg::MinionOps::Exec,
-                                        payload: thejob.into(),
-                                    }
-                            ).unwrap()) ).await {
-                            Ok(_) => {
-                                state.onjob = Some(job.id.clone());
-                                ()
-                            },
-                            Err(_) => {
-                                // XXX does this actually close ? might need to poison pill the
-                                // receiver
-                                s.close().await.unwrap_or_default();
-                                state.sender = None; 
+        match state.sender.as_mut() {
+            Some(s) => {
+                let x =  s.send(
+                    Message::Binary(minion_msg::to_vec(
+                            &minion_msg::MinionMsg{ 
+                                op: minion_msg::MinionOps::Exec,
+                                payload: thejob.into(),
                             }
-                        }
+                    ).unwrap()) ).await;
+                match x {
+                    Ok(_) => {
+                        state.onjob = Some(payload.job.id.clone());
+                        ()
                     },
-                    None => {
-                        panic!();
+                    Err(_) => {
+                        // XXX does this actually close ? might need to poison pill the
+                        // receiver
+                        s.close().await.unwrap_or_default();
+                        state.sender = None; 
                     }
                 }
             },
-            MinionMessages::Ret { result } => {
-                let j = match state.onjob {
+            None => {
+                panic!();
+            }
+        }
+    }
+
+    async fn handle_ret(&self, state: &mut MinionActorState, payload: MinionActorMessagesRet) { 
+        let j = match state.onjob {
                     Some(j) => j,
                     None => {
-                        print!("{:?} got res back but no job ? {:?}", state.id, result);
+                        print!("{:?} got res back but no job ? {:?}", state.id, payload.result);
                         // so, something should happen here 
                         return;
                     }
@@ -337,23 +305,20 @@ impl MinionActor {
                 state.onjob = None;
 
                 match state.sup_ch.as_mut() {
-                    Some(c) => c.send(MinionSupMessages::JobResult { 
+                    Some(c) => c.send(MinionSupActorMessages::JobResult( MinionSupActorMessagesJobResult{ 
                         job_id: j, 
-                        result: result.map_err(|e| {
+                        result: payload.result.map_err(|e| {
                             match e {
                                 minion_msg::MinionErrors::BadCode => JobErrors::BadCode,
                                 minion_msg::MinionErrors::ExecFault => JobErrors::MinionAborted,
                             }
                         }),
-                    }).await.unwrap_or_default(), // XXX what to do if sup goes away ? 
+                    })).await.unwrap_or_default(), // XXX what to do if sup goes away ? 
                     None => (),
                 }
-            },
-        }
-    }
+            }
 
-    fn handle_socket(&self, state: &MinionState, mut receiver: SplitStream<WebSocket>) {
-
+    fn handle_socket(&self, state: &MinionActorState, mut receiver: SplitStream<WebSocket>) {
         let id = state.id.clone();
         let tx = state.tx.clone();
         tokio::spawn(async move {
@@ -370,7 +335,7 @@ impl MinionActor {
                             match m.op {
                                 MinionOps::Ret => {
                                     println!("minion returned {:?}", m.payload);
-                                    tx.send(MinionMessages::Ret { result: Ok(m.payload) }).await.unwrap_or_default();
+                                    tx.send(MinionActorMessages::Ret(MinionActorMessagesRet{ result: Ok(m.payload) })).await.unwrap_or_default();
                                 },
                                 _ => {
                                     println!("minion {:?} bad message {:?}", id, m.op);
