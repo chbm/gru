@@ -9,14 +9,17 @@ edition = "2018"
 
 [dependencies]
 axum = { version = "0.5.3", features = ["ws", "headers", "http2"] }
+hyper = { version = "0.14", features = ["full"] }
 tokio = { version = "1.0", features = ["full"] }
+tower = "0.4.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tower-http = { version = "0.2.0", features = ["fs", "trace"] }
+tower-http = { version = "0.3", features = ["fs", "trace"] }
 headers = "0.3"
 minion_msg = { version = "0.1.0", path = "../minion_msg" }
 async-trait = "0.1.53"
 enum_dispatch = "0.3.8"
 futures = "0.3.21"
 uuid = { version = "1.0.0", features = [ "v4", ] }
+anyhow = "1.0.57"
 murray = { path = "../murray" }

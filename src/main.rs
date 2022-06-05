@@ -1,6 +1,8 @@
-use std::collections::hash_map::HashMap;
+use std::{
+    collections::hash_map::HashMap,
+    io
+};
 use std::sync::Arc;
-
 use axum::{
     extract::Extension,
     extract::{
@@ -9,18 +11,15 @@ use axum::{
     },
     http::{StatusCode, Uri},
     response::IntoResponse,
-    routing::get,
+    routing::{get, get_service},
     Router,
 };
 use futures::{sink::SinkExt, stream::{StreamExt, SplitSink, SplitStream}};
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
-use tower_http::{
-    trace::{DefaultMakeSpan, TraceLayer},
-};
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-use uuid::{uuid, Uuid};
 
 use minion_msg::{MinionMsg, MinionOps};
 
@@ -40,6 +39,12 @@ struct ServerState {
     sup_ch: mpsc::Sender<MinionSupActorMessages>,
 }
 
+
+async fn handle_error(_err: io::Error) -> impl IntoResponse {
+    (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong...")
+}
+
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
@@ -55,13 +60,15 @@ async fn main() {
     };
     let shared_state = Arc::new(state);
     
+    let code_server = ServeDir::new("/tmp/gru");
     let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .layer(Extension(shared_state))
-        .layer(
-            TraceLayer::new_for_http()
+        .nest("/code/", get_service(code_server).handle_error(handle_error))
+            .route("/ws", get(ws_handler))
+            .layer(Extension(shared_state))
+            .layer(
+                TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::default().include_headers(true)),
-        );
+            );
 
     // run it with hyper
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
@@ -143,7 +150,7 @@ impl MinionSupActor {
                                     println!("handling {:?}", m.op);
                                     let m = MinionSupActorMessages::Connected(MinionSupActorMessagesConnected{
                                         id: m.payload.into(),
-                                        socket: socket,
+                                        socket,
                                     });
                                     return c.send(m).await.unwrap();
                                 }
@@ -253,25 +260,13 @@ impl MinionActor {
             return;
         }
 
-        let thejob = r#"
-    (module
-      (type $t0 (func (param i32) (result i32)))
-      (type $t1 (func (param) (result i32)))
-      (func $add_one (export "add_one") (type $t0) (param $p0 i32) (result i32)
-        get_local $p0
-        i32.const 1
-        i32.add)
-      (func $run (export "run") (type $t1) (result i32)
-        i32.const 42
-        call $add_one))
-    "#;
         match state.sender.as_mut() {
             Some(s) => {
                 let x =  s.send(
                     Message::Binary(minion_msg::to_vec(
                             &minion_msg::MinionMsg{ 
                                 op: minion_msg::MinionOps::Exec,
-                                payload: thejob.into(),
+                                payload: "/code/basicjob".into(),
                             }
                     ).unwrap()) ).await;
                 match x {
@@ -362,5 +357,20 @@ impl MinionActor {
     }
 }
 
+//    (module
+//      (type $t0 (func (param i32) (result i32)))
+//      (type $t1 (func (param) (result i32)))
+//      (func $add_one (export "add_one") (type $t0) (param $p0 i32) (result i32)
+//        get_local $p0
+//        i32.const 1
+//        i32.add)
+//      (func $run (export "run") (type $t1) (result i32)
+//        i32.const 42
+//        call $add_one))
 
 
+
+#[cfg(test)]
+mod tests {
+
+}
